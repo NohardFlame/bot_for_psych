@@ -18,6 +18,7 @@ try:
     from .scheduler import ContentScheduler
     from .file_id_cache import FileIdCache
     from .keyboard_builder import KeyboardBuilder
+    from .present_navigator import PresentNavigator
 except ImportError:
     from user_manager import UserManager
     from day_calculator import DayCalculator
@@ -26,6 +27,7 @@ except ImportError:
     from scheduler import ContentScheduler
     from file_id_cache import FileIdCache
     from keyboard_builder import KeyboardBuilder
+    from present_navigator import PresentNavigator
 
 from disk_api_handler.disk_handler import YandexDiskHandler
 
@@ -97,6 +99,9 @@ class DailyContentBot:
         # Track navigation message IDs per user (chat_id -> message_id)
         self.navigation_messages: Dict[int, int] = {}  # chat_id -> message_id
         
+        # Track present folder navigation breadcrumbs per user (chat_id -> list of paths)
+        self.present_navigation_paths: Dict[int, list] = {}  # chat_id -> [path1, path2, ...]
+        
         # Initialize scheduler (default: 9:00 AM, configurable)
         from datetime import time as dt_time
         self.scheduler = ContentScheduler(
@@ -124,20 +129,20 @@ class DailyContentBot:
             # Get program data
             program_data = self.user_manager.get_program_data(username)
             if not program_data:
-                self.bot.send_message(chat_id, "❌ Ошибка: программа не найдена")
+                self.bot.send_message(chat_id, "❌ Ошибка: программа не найдена", parse_mode="HTML")
                 return
             
             program_key = self.user_manager.find_user_program(username)
             begin_date = program_data.get('begin_date')
             
             if not begin_date:
-                self.bot.send_message(chat_id, "❌ Ошибка: дата начала не найдена")
+                self.bot.send_message(chat_id, "❌ Ошибка: дата начала не найдена", parse_mode="HTML")
                 return
             
             # Calculate current day number based on begin_date
             begin_date_obj = self.day_calculator.parse_begin_date(begin_date)
             if not begin_date_obj:
-                self.bot.send_message(chat_id, "❌ Ошибка: неверная дата начала")
+                self.bot.send_message(chat_id, "❌ Ошибка: неверная дата начала", parse_mode="HTML")
                 return
             
             from datetime import date as dt_date
@@ -152,7 +157,8 @@ class DailyContentBot:
             if not available_days:
                 self.bot.send_message(
                     chat_id,
-                    "📭 Пока нет доступных дней программы. Контент появится позже."
+                    "📭 Пока нет доступных дней программы. Контент появится позже.",
+                    parse_mode="HTML"
                 )
                 return
             
@@ -200,7 +206,7 @@ class DailyContentBot:
         except Exception as e:
             error_msg = f"Неожиданная ошибка: {str(e)}"
             print(error_msg)
-            self.bot.send_message(chat_id, f"❌ {error_msg}")
+            self.bot.send_message(chat_id, f"❌ {error_msg}", parse_mode="HTML")
     
     def _deliver_single_day(self, username: str, chat_id: int, day_number: int) -> bool:
         """
@@ -257,6 +263,93 @@ class DailyContentBot:
             print(error_msg)
             return False
     
+    def _handle_present_folder_navigation(self, chat_id: int, folder_path: str = "") -> None:
+        """
+        Handle present folder navigation - display message and folder buttons.
+        
+        Args:
+            chat_id: Telegram chat ID
+            folder_path: Relative path within present folder (empty for root)
+        """
+        try:
+            # Validate folder path for security
+            if not PresentNavigator.validate_folder_path(folder_path):
+                self.bot.send_message(chat_id, "❌ Неверный путь. Доступ запрещен.", parse_mode="HTML")
+                return
+            
+            # Read message from folder
+            message_text = PresentNavigator.get_folder_message(self.disk_handler, folder_path)
+            if not message_text:
+                message_text = "📁"  # Default message if msg.txt doesn't exist
+            
+            # Get subfolders
+            subfolders = PresentNavigator.get_subfolders(self.disk_handler, folder_path)
+            
+            # Determine if there's a parent folder (for back button)
+            has_parent = bool(folder_path and folder_path.strip() != "/")
+            
+            # Build keyboard
+            keyboard = KeyboardBuilder.build_present_folder_keyboard(
+                subfolders,
+                current_path=folder_path,
+                has_parent=has_parent
+            )
+            
+            # Update breadcrumb trail
+            if chat_id not in self.present_navigation_paths:
+                self.present_navigation_paths[chat_id] = []
+            
+            breadcrumb = self.present_navigation_paths[chat_id]
+            
+            # Build breadcrumb from folder_path (e.g., "option1/option2" -> ["option1", "option1/option2"])
+            if folder_path:
+                # Split path into components and build cumulative paths
+                parts = folder_path.strip('/').split('/')
+                new_breadcrumb = []
+                current_path = ""
+                for part in parts:
+                    if current_path:
+                        current_path = f"{current_path}/{part}"
+                    else:
+                        current_path = part
+                    new_breadcrumb.append(current_path)
+                self.present_navigation_paths[chat_id] = new_breadcrumb
+            else:
+                # Root folder
+                self.present_navigation_paths[chat_id] = []
+            
+            # Send or edit message
+            # Try to edit existing message if it exists in navigation_messages
+            if chat_id in self.navigation_messages:
+                message_id = self.navigation_messages[chat_id]
+                try:
+                    self.bot.edit_message_text(
+                        message_text if message_text else "📁",
+                        chat_id,
+                        message_id,
+                        reply_markup=keyboard,
+                        parse_mode="HTML"
+                    )
+                    return
+                except Exception:
+                    # Message might have been deleted or can't be edited, send new one
+                    pass
+            
+            # Send new message
+            sent_message = self.bot.send_message(
+                chat_id,
+                message_text if message_text else "📁",
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+            if sent_message:
+                self.navigation_messages[chat_id] = sent_message.message_id
+                
+        except Exception as e:
+            error_msg = f"Ошибка при навигации: {str(e)}"
+            print(error_msg)
+            self.bot.send_message(chat_id, f"❌ {error_msg}", parse_mode="HTML")
+    
     def _register_handlers(self) -> None:
         """Register all bot handlers."""
         
@@ -266,6 +359,29 @@ class DailyContentBot:
             chat_id = message.chat.id
             username = message.from_user.username
             
+            # Check for deep link parameter (p=)
+            # Format: /start p=option1 or /start p=option1/option2 or /start p= (for root)
+            command_text = message.text or ""
+            folder_path = ""
+            has_p_param = False
+            
+            if "p=" in command_text:
+                has_p_param = True
+                # Extract path after p=
+                parts = command_text.split("p=", 1)
+                if len(parts) > 1:
+                    folder_path = parts[1].strip()
+                    # Remove any extra spaces or newlines
+                    folder_path = folder_path.split()[0] if folder_path.split() else ""
+            
+            # If deep link parameter is present (even if empty), handle present folder navigation (public access)
+            if has_p_param:
+                # Public access - no registration required for present folder navigation
+                # Handle present folder navigation (empty folder_path means root)
+                self._handle_present_folder_navigation(chat_id, folder_path)
+                return
+            
+            # Normal bot flow (requires registration)
             if not username:
                 self.bot.reply_to(
                     message,
@@ -472,6 +588,48 @@ class DailyContentBot:
             username = call.from_user.username
             callback_data = call.data
             
+            # Check if this is a present folder navigation callback (public access)
+            present_parsed = KeyboardBuilder.parse_present_callback_data(callback_data)
+            if present_parsed:
+                # Present folder navigation - public access, no registration required
+                action = present_parsed.get('action')
+                
+                # Answer callback query (required by Telegram)
+                self.bot.answer_callback_query(call.id)
+                
+                try:
+                    if action == 'present_folder':
+                        # User selected a folder
+                        folder_path = present_parsed.get('folder_path', '')
+                        self._handle_present_folder_navigation(chat_id, folder_path)
+                    
+                    elif action == 'present_back':
+                        # User clicked back button
+                        if chat_id in self.present_navigation_paths and self.present_navigation_paths[chat_id]:
+                            # Remove current path from breadcrumb
+                            breadcrumb = self.present_navigation_paths[chat_id]
+                            breadcrumb.pop()  # Remove current
+                            
+                            # Get parent path
+                            if breadcrumb:
+                                parent_path = breadcrumb[-1]
+                            else:
+                                parent_path = ""  # Back to root
+                            
+                            # Navigate to parent
+                            self._handle_present_folder_navigation(chat_id, parent_path)
+                        else:
+                            # No breadcrumb, go to root
+                            self._handle_present_folder_navigation(chat_id, "")
+                    
+                except Exception as e:
+                    error_msg = f"Ошибка навигации: {str(e)}"
+                    print(error_msg)
+                    self.bot.send_message(chat_id, f"❌ {error_msg}", parse_mode="HTML")
+                
+                return  # Exit early for present folder callbacks
+            
+            # Normal bot flow callbacks (require registration)
             if not username:
                 self.bot.answer_callback_query(call.id, "❌ Username не установлен")
                 return
@@ -512,7 +670,7 @@ class DailyContentBot:
                     day_number = parsed.get('day_number')
                     if day_number:
                         # Show loading message
-                        loading_msg = self.bot.send_message(chat_id, f"⏳ Загрузка контента для дня {day_number}...")
+                        loading_msg = self.bot.send_message(chat_id, f"⏳ Загрузка контента для дня {day_number}...", parse_mode="HTML")
                         
                         # Deliver content for selected day
                         success = self._deliver_single_day(username, chat_id, day_number)
@@ -526,7 +684,8 @@ class DailyContentBot:
                         if not success:
                             self.bot.send_message(
                                 chat_id,
-                                f"❌ Не удалось загрузить контент для дня {day_number}. Возможно, контент еще не готов."
+                                f"❌ Не удалось загрузить контент для дня {day_number}. Возможно, контент еще не готов.",
+                                parse_mode="HTML"
                             )
                 
                 elif action in ('prev_page', 'next_page'):
@@ -547,7 +706,7 @@ class DailyContentBot:
             except Exception as e:
                 error_msg = f"Ошибка: {str(e)}"
                 print(error_msg)
-                self.bot.send_message(chat_id, f"❌ {error_msg}")
+                self.bot.send_message(chat_id, f"❌ {error_msg}", parse_mode="HTML")
         
         @self.bot.message_handler(func=lambda message: True)
         def handle_message(message):

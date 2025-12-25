@@ -43,20 +43,22 @@ class ContentSender:
         self.file_id_cache = file_id_cache
         self.cache_chat_id = cache_chat_id
     
-    def send_text_content(self, chat_id: int, text: str, reply_markup=None) -> bool:
+    def send_text_content(self, chat_id: int, text: str, reply_markup=None, parse_mode: str = "HTML") -> bool:
         """
         Send text content to user.
         
         Args:
             chat_id: Telegram chat ID
-            text: Text content to send
+            text: Text content to send (supports HTML formatting)
             reply_markup: Optional inline keyboard markup
+            parse_mode: Parse mode for formatting ("HTML", "MarkdownV2", or None)
+                       Defaults to "HTML" to support formatting in text files
         
         Returns:
             True if successful, False otherwise
         """
         try:
-            self.bot.send_message(chat_id, text, reply_markup=reply_markup)
+            self.bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
             return True
         except Exception as e:
             print(f"Error sending text: {str(e)}")
@@ -347,7 +349,7 @@ class ContentSender:
         # Send links message if any links were processed
         if links_sent:
             try:
-                self.bot.send_message(chat_id, links_message.strip())
+                self.bot.send_message(chat_id, links_message.strip(), parse_mode="HTML")
             except Exception as e:
                 print(f"Error sending links message: {str(e)}")
                 success = False
@@ -425,40 +427,44 @@ class ContentSender:
         message = f"❌ Ошибка: {error_msg}"
         return self.send_text_content(chat_id, message)
     
-    def send_navigation_message(self, chat_id: int, text: str, reply_markup) -> Optional[int]:
+    def send_navigation_message(self, chat_id: int, text: str, reply_markup, parse_mode: str = "HTML") -> Optional[int]:
         """
         Send navigation message with inline keyboard.
         
         Args:
             chat_id: Telegram chat ID
-            text: Message text
+            text: Message text (supports HTML formatting)
             reply_markup: Inline keyboard markup
+            parse_mode: Parse mode for formatting ("HTML", "MarkdownV2", or None)
+                       Defaults to "HTML" to support formatting in text files
         
         Returns:
             Message ID if successful, None otherwise
         """
         try:
-            message = self.bot.send_message(chat_id, text, reply_markup=reply_markup)
+            message = self.bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
             return message.message_id
         except Exception as e:
             print(f"Error sending navigation message: {str(e)}")
             return None
     
-    def edit_navigation_message(self, chat_id: int, message_id: int, text: str, reply_markup) -> bool:
+    def edit_navigation_message(self, chat_id: int, message_id: int, text: str, reply_markup, parse_mode: str = "HTML") -> bool:
         """
         Edit existing navigation message.
         
         Args:
             chat_id: Telegram chat ID
             message_id: Message ID to edit
-            text: New message text
+            text: New message text (supports HTML formatting)
             reply_markup: New inline keyboard markup
+            parse_mode: Parse mode for formatting ("HTML", "MarkdownV2", or None)
+                       Defaults to "HTML" to support formatting in text files
         
         Returns:
             True if successful, False otherwise
         """
         try:
-            self.bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup)
+            self.bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup, parse_mode=parse_mode)
             return True
         except telebot.apihelper.ApiTelegramException as e:
             # Handle specific Telegram API errors

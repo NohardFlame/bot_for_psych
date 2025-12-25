@@ -172,4 +172,64 @@ class KeyboardBuilder:
         except TypeError:
             # Fallback if input_field_placeholder is not supported
             return types.ForceReply(force_reply=True)
+    
+    @staticmethod
+    def build_present_folder_keyboard(
+        subfolders: List[str],
+        current_path: str = "",
+        has_parent: bool = False
+    ) -> types.InlineKeyboardMarkup:
+        """
+        Build inline keyboard for present folder navigation.
+        
+        Args:
+            subfolders: List of subfolder names
+            current_path: Current relative path within present folder (for callback data)
+            has_parent: Whether there's a parent folder (show back button)
+        
+        Returns:
+            InlineKeyboardMarkup with folder buttons and back button (if applicable)
+        """
+        keyboard = []
+        
+        # Add folder buttons (2 buttons per row for better layout)
+        buttons_per_row = 2
+        for i in range(0, len(subfolders), buttons_per_row):
+            row = subfolders[i:i + buttons_per_row]
+            keyboard_row = []
+            for folder_name in row:
+                # Encode folder path in callback data
+                if current_path:
+                    new_path = f"{current_path}/{folder_name}"
+                else:
+                    new_path = folder_name
+                callback_data = f"present_folder:{new_path}"
+                keyboard_row.append(types.InlineKeyboardButton(folder_name, callback_data=callback_data))
+            keyboard.append(keyboard_row)
+        
+        # Add back button if there's a parent
+        if has_parent:
+            back_callback = "present_back"
+            keyboard.append([types.InlineKeyboardButton("◀️ Назад", callback_data=back_callback)])
+        
+        return types.InlineKeyboardMarkup(keyboard)
+    
+    @staticmethod
+    def parse_present_callback_data(callback_data: str) -> Optional[dict]:
+        """
+        Parse present folder navigation callback data.
+        
+        Args:
+            callback_data: Callback data string (e.g., "present_folder:option1", "present_back")
+        
+        Returns:
+            Dictionary with 'action' and optional 'folder_path', or None if invalid
+        """
+        if callback_data == "present_back":
+            return {'action': 'present_back'}
+        elif callback_data.startswith("present_folder:"):
+            folder_path = callback_data[15:]  # Extract path after "present_folder:"
+            return {'action': 'present_folder', 'folder_path': folder_path}
+        else:
+            return None
 

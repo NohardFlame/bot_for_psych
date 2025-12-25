@@ -163,6 +163,7 @@ class ContentScheduler:
             # Deliver each day in sequence
             at_least_one_success = False
             last_error = None
+            has_non_missing_folder_errors = False  # Track if we encountered errors other than missing folders
             
             for day_number in days_to_deliver:
                 try:
@@ -179,11 +180,11 @@ class ContentScheduler:
                     if content_data.get('error'):
                         error_msg = content_data['error']
                         if error_msg == "Day folder not found":
-                            # Day not ready yet, skip it (don't update timestamp)
-                            last_error = f"Day {day_number} folder not found for {username}"
+                            # Day not ready yet, silently skip it (don't update timestamp, don't log as error)
                             continue
                         else:
                             # Other error, skip this day
+                            has_non_missing_folder_errors = True
                             last_error = f"Content fetch error for day {day_number} ({username}): {error_msg}"
                             continue
                     
@@ -191,6 +192,7 @@ class ContentScheduler:
                     success = self.content_sender.send_day_content(chat_id, content_data)
                     if not success:
                         # Failed to send, don't update timestamp
+                        has_non_missing_folder_errors = True
                         last_error = f"Failed to send content for day {day_number} to {username}"
                         continue
                     
@@ -200,6 +202,7 @@ class ContentScheduler:
                     
                 except Exception as e:
                     # Error delivering this day, continue with next day
+                    has_non_missing_folder_errors = True
                     last_error = f"Exception delivering day {day_number} to {username}: {str(e)}"
                     print(last_error)
                     continue
@@ -207,8 +210,11 @@ class ContentScheduler:
             # Return success if at least one day was delivered
             if at_least_one_success:
                 return True, None
+            elif not has_non_missing_folder_errors:
+                # All days failed only because folders don't exist - silently skip
+                return True, None
             else:
-                # All days failed
+                # All days failed for other reasons
                 return False, last_error or f"Failed to deliver any days to {username}"
             
         except Exception as e:
