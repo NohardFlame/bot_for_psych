@@ -68,7 +68,12 @@ class DailyContentBot:
         self.logger = setup_logger()
         self.logger.info("Initializing DailyContentBot")
         
-        # Initialize bot
+        # Initialize bot with increased timeout for large file uploads
+        # Set longer timeouts: 30s connect, 300s (5min) read/write for large files
+        import telebot.apihelper
+        telebot.apihelper.CONNECT_TIMEOUT = 30
+        telebot.apihelper.READ_TIMEOUT = 300  # 5 minutes for large file uploads
+        
         self.bot = telebot.TeleBot(bot_token_value)
         
         # Initialize file ID cache
@@ -157,10 +162,29 @@ class DailyContentBot:
             if current_day < 1:
                 current_day = 1  # At least show day 1
             
-            # Get available days from disk
-            available_days = self.content_fetcher.get_available_days(program_key, current_day)
+            # Use a more generous max_day value to ensure all days on disk are found
+            # Similar to scheduler's approach - check at least up to day 100
+            # Note: get_available_days now lists the program directory once, so this is mainly for filtering
+            max_day_to_check = max(current_day, 100)
+            
+            # Get available days from disk (optimized to list directory once)
+            try:
+                all_available_days = self.content_fetcher.get_available_days(program_key, max_day_to_check)
+            except Exception as e:
+                self.logger.error(f"Error getting available days for program {program_key}: {str(e)}", exc_info=True)
+                self.bot.send_message(
+                    chat_id,
+                    f"❌ Ошибка при получении списка дней: {str(e)}",
+                    parse_mode="HTML"
+                )
+                return
+            
+            # IMPORTANT: Filter to only show days that are <= current_day (based on begin_date)
+            # This prevents users from selecting future days even if they exist on disk
+            available_days = [d for d in all_available_days if d <= current_day]
             
             if not available_days:
+                self.logger.warning(f"No available days found for program {program_key} (user {username})")
                 self.bot.send_message(
                     chat_id,
                     "📭 Пока нет доступных дней программы. Контент появится позже.",
@@ -178,42 +202,67 @@ class DailyContentBot:
                 f"Используйте кнопки ниже для выбора."
             )
             
-            # Update or send navigation message
+            # Always send a new navigation message at the bottom for better UX
+            # Delete old navigation message if it exists, then send a new one
             if chat_id in self.navigation_messages:
-                # Try to edit existing message
-                message_id = self.navigation_messages[chat_id]
+                old_message_id = self.navigation_messages[chat_id]
                 try:
-                    success = self.content_sender.edit_navigation_message(
-                        chat_id, message_id, message_text, keyboard
-                    )
-                    if not success:
-                        # Message might have been deleted, send new one
-                        new_message_id = self.content_sender.send_navigation_message(
-                            chat_id, message_text, keyboard
-                        )
-                        if new_message_id:
-                            self.navigation_messages[chat_id] = new_message_id
+                    # Try to delete the old message to keep chat clean
+                    self.bot.delete_message(chat_id, old_message_id)
+                    self.logger.debug(f"Deleted old navigation message {old_message_id} for chat_id {chat_id}")
                 except Exception as e:
-                    # Error editing message (e.g., message was deleted), send new one
-                    print(f"Error editing navigation message: {str(e)}")
-                    new_message_id = self.content_sender.send_navigation_message(
-                        chat_id, message_text, keyboard
-                    )
-                    if new_message_id:
-                        self.navigation_messages[chat_id] = new_message_id
+                    # If deletion fails (message already deleted, etc.), that's okay
+                    self.logger.debug(f"Could not delete old navigation message {old_message_id}: {str(e)}")
+                # Clear the old message ID
+                del self.navigation_messages[chat_id]
+            
+            # Send new navigation message (will appear at the bottom)
+            self.logger.debug(f"Sending new navigation message for chat_id {chat_id}")
+            new_message_id = self.content_sender.send_navigation_message(
+                chat_id, message_text, keyboard
+            )
+            if new_message_id:
+                self.navigation_messages[chat_id] = new_message_id
+                self.logger.debug(f"Successfully sent new navigation message {new_message_id} at bottom")
             else:
-                # Send new message
-                new_message_id = self.content_sender.send_navigation_message(
-                    chat_id, message_text, keyboard
-                )
-                if new_message_id:
-                    self.navigation_messages[chat_id] = new_message_id
+                self.logger.error(f"Failed to send navigation message for chat_id {chat_id}")
+                # Send a fallback error message
+                try:
+                    self.bot.send_message(
+                        chat_id,
+                        "❌ Ошибка при отображении списка дней. Пожалуйста, попробуйте еще раз.",
+                        parse_mode="HTML"
+                    )
+                except Exception as fallback_error:
+                    self.logger.error(f"Failed to send fallback error message: {str(fallback_error)}")
                     
         except Exception as e:
             error_msg = f"Неожиданная ошибка: {str(e)}"
             print(error_msg)
             self.logger.error(f"Unexpected error in _handle_present_folder_navigation for chat_id {chat_id}: {str(e)}", exc_info=True)
             self.bot.send_message(chat_id, f"❌ {error_msg}", parse_mode="HTML")
+    
+    def _deliver_backlog_to_user(self, username: str, chat_id: int) -> None:
+        """
+        Deliver backlog content to a user immediately after registration.
+        Uses the scheduler's delivery method to ensure all available days are delivered.
+        
+        Args:
+            username: Telegram username
+            chat_id: Telegram chat ID
+        """
+        try:
+            self.logger.info(f"Delivering backlog to user {username} (chat_id: {chat_id})")
+            success, error_msg = self.scheduler._deliver_content_to_user(username, chat_id)
+            if success:
+                self.logger.info(f"Successfully delivered backlog to user {username} (chat_id: {chat_id})")
+            else:
+                if error_msg:
+                    self.logger.warning(f"Backlog delivery to user {username} (chat_id: {chat_id}) completed with issues: {error_msg}")
+                else:
+                    self.logger.info(f"No backlog to deliver for user {username} (chat_id: {chat_id}) - user is up to date")
+        except Exception as e:
+            self.logger.error(f"Error delivering backlog to user {username} (chat_id: {chat_id}): {str(e)}", exc_info=True)
     
     def _deliver_single_day(self, username: str, chat_id: int, day_number: int) -> bool:
         """
@@ -251,10 +300,27 @@ class DailyContentBot:
             # Check for errors
             if content_data.get('error'):
                 error_msg = content_data['error']
+                self.logger.warning(f"Error fetching content for day {day_number} (user {username}): {error_msg}")
                 if error_msg == "Day folder not found":
+                    return False
+                elif error_msg == "Folder is empty":
+                    self.logger.warning(f"Day {day_number} folder is empty for user {username}")
                     return False
                 else:
                     return False
+            
+            # Check if there's any content to send
+            has_content = (
+                content_data.get('text_content') or
+                content_data.get('media_files') or
+                content_data.get('document_files') or
+                content_data.get('image_paths') or
+                content_data.get('other_files')
+            )
+            
+            if not has_content:
+                self.logger.warning(f"No content found for day {day_number} (user {username})")
+                return False
             
             # Send content
             success = self.content_sender.send_day_content(chat_id, content_data)
@@ -263,6 +329,8 @@ class DailyContentBot:
                 # For now, we'll just update it to the day that was delivered
                 self.user_manager.update_user_last_message_date(username, day_number, begin_date)
                 self.logger.debug(f"Updated last_message_date for user {username} to day {day_number}")
+            else:
+                self.logger.warning(f"Failed to send content for day {day_number} to user {username}")
             
             return success
             
@@ -464,6 +532,8 @@ class DailyContentBot:
                         reply_markup=KeyboardBuilder.build_main_menu_keyboard()
                     )
                     self.user_states.pop(chat_id, None)
+                    # Deliver backlog immediately after name is set
+                    self._deliver_backlog_to_user(username, chat_id)
                 else:
                     self.bot.reply_to(
                         message,
@@ -753,6 +823,8 @@ class DailyContentBot:
                         reply_markup=KeyboardBuilder.build_main_menu_keyboard()
                     )
                     self.user_states.pop(chat_id, None)
+                    # Deliver backlog immediately after name is set
+                    self._deliver_backlog_to_user(username, chat_id)
                 else:
                     self.logger.warning(f"Failed to set name for user {username} (chat_id: {chat_id}): name is empty")
                     self.bot.reply_to(

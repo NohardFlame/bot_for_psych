@@ -110,14 +110,14 @@ class YandexDiskHandler:
         if normalized == "disk:/":
             return "disk:/bot"
         
-        # Check if path already starts with "disk:/bot/" to avoid double-prefixing
-        if normalized.startswith("disk:/bot/"):
+        # Check if path already starts with "disk:/bot/" or is exactly "disk:/bot" to avoid double-prefixing
+        if normalized.startswith("disk:/bot/") or normalized == "disk:/bot":
             return normalized
         
         # Insert "bot/" after "disk:/"
         # "disk:/path" -> "disk:/bot/path"
         if normalized.startswith("disk:/"):
-            return "disk:/bot" + normalized[6:]  # Remove "disk:/" (6 chars), add "disk:/bot"
+            return "disk:/bot/" + normalized[6:]  # Remove "disk:/" (6 chars), add "disk:/bot/"
         
         # Fallback (shouldn't reach here, but just in case)
         return normalized

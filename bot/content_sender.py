@@ -8,14 +8,17 @@ import telebot
 import telebot.apihelper
 from typing import List, Dict, Any, Optional
 from pathlib import Path
+import time
+import os
 from disk_api_handler.disk_handler import YandexDiskHandler, APIError
-import telebot.types as types
 
 # Handle both package and direct execution
 try:
     from .file_id_cache import FileIdCache
+    from .operation_logger import get_logger
 except ImportError:
     from file_id_cache import FileIdCache
+    from operation_logger import get_logger
 
 
 class ContentSender:
@@ -42,6 +45,12 @@ class ContentSender:
         self.disk_handler = disk_handler
         self.file_id_cache = file_id_cache
         self.cache_chat_id = cache_chat_id
+        self.logger = get_logger()
+        # Retry configuration
+        self.max_retries = 3
+        self.retry_delay = 2  # Initial delay in seconds
+        # Rate limiting: delay between file sends to avoid Telegram rate limits
+        self.delay_between_files = 0.3  # 300ms delay between files
     
     def send_text_content(self, chat_id: int, text: str, reply_markup=None, parse_mode: str = "HTML") -> bool:
         """
@@ -61,7 +70,7 @@ class ContentSender:
             self.bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
             return True
         except Exception as e:
-            print(f"Error sending text: {str(e)}")
+            self.logger.error(f"Error sending text to chat_id {chat_id}: {str(e)}", exc_info=True)
             return False
     
     def send_images(self, chat_id: int, image_paths: List[str]) -> bool:
@@ -76,9 +85,12 @@ class ContentSender:
             True if all images sent successfully, False otherwise
         """
         success = True
-        for image_path in image_paths:
+        for i, image_path in enumerate(image_paths):
             if not self._send_media_with_cache(chat_id, image_path, 'photo', protect_content=True):
                 success = False
+            # Add delay between files to avoid rate limiting (except for last file)
+            if i < len(image_paths) - 1:
+                time.sleep(self.delay_between_files)
         
         return success
     
@@ -148,35 +160,193 @@ class ContentSender:
         if file_id:
             return file_id
         
-        # Not in cache, need to upload to cache chat
-        try:
-            with open(file_path, 'rb') as file_handle:
-                if file_type == 'photo':
-                    message = self.bot.send_photo(self.cache_chat_id, file_handle, protect_content=True)
-                    file_id = message.photo[-1].file_id  # Get largest photo size
-                elif file_type == 'video':
-                    message = self.bot.send_video(self.cache_chat_id, file_handle, protect_content=True)
-                    file_id = message.video.file_id
-                elif file_type == 'audio':
-                    message = self.bot.send_audio(self.cache_chat_id, file_handle, protect_content=True)
-                    file_id = message.audio.file_id
-                elif file_type == 'document':
-                    message = self.bot.send_document(self.cache_chat_id, file_handle, protect_content=True)
-                    file_id = message.document.file_id
-                else:
+        # Not in cache, need to upload to cache chat (with retry)
+        for attempt in range(self.max_retries):
+            try:
+                with open(file_path, 'rb') as file_handle:
+                    if file_type == 'photo':
+                        message = self.bot.send_photo(self.cache_chat_id, file_handle, protect_content=True)
+                        file_id = message.photo[-1].file_id  # Get largest photo size
+                    elif file_type == 'video':
+                        message = self.bot.send_video(self.cache_chat_id, file_handle, protect_content=True)
+                        file_id = message.video.file_id
+                    elif file_type == 'audio':
+                        message = self.bot.send_audio(self.cache_chat_id, file_handle, protect_content=True)
+                        file_id = message.audio.file_id
+                    elif file_type == 'document':
+                        message = self.bot.send_document(self.cache_chat_id, file_handle, protect_content=True)
+                        file_id = message.document.file_id
+                    else:
+                        return None
+                    
+                    # Store in cache
+                    self.file_id_cache.set_file_id(file_path, file_id)
+                    self.logger.debug(f"Cached file_id for {file_path} (type: {file_type})")
+                    return file_id
+                    
+            except FileNotFoundError:
+                self.logger.warning(f"File not found for caching: {file_path}")
+                return None
+            except Exception as e:
+                error_str = str(e).lower()
+                # Check for ConnectionResetError (10054) - rate limiting or connection issues
+                is_connection_reset = (
+                    'connectionreset' in error_str or
+                    '10054' in error_str or
+                    'forcibly closed' in error_str or
+                    'connection aborted' in error_str
+                )
+                is_retryable = (
+                    'timeout' in error_str or
+                    'connection' in error_str or
+                    'timed out' in error_str or
+                    'write operation' in error_str or
+                    is_connection_reset
+                )
+                
+                if not is_retryable or attempt == self.max_retries - 1:
+                    # Non-retryable or last attempt
+                    self.logger.error(f"Error uploading file to cache chat {file_path}: {str(e)}", exc_info=True)
                     return None
                 
-                # Store in cache
-                self.file_id_cache.set_file_id(file_path, file_id)
-                print(f"Cached file_id for {file_path} (type: {file_type})")
-                return file_id
+                # Retry with exponential backoff (longer for connection resets)
+                if is_connection_reset:
+                    delay = self.retry_delay * (2 ** attempt) + 1  # Extra delay for rate limits
+                else:
+                    delay = self.retry_delay * (2 ** attempt)
+                file_size_mb = self._get_file_size_mb(file_path)
+                error_type = "rate limit/connection reset" if is_connection_reset else "timeout/connection"
+                self.logger.warning(
+                    f"{error_type.capitalize()} error uploading to cache {file_path} (attempt {attempt + 1}/{self.max_retries}, "
+                    f"size: {file_size_mb:.2f}MB): {str(e)}. Retrying in {delay}s..."
+                )
+                time.sleep(delay)
+        
+        return None
+    
+    def _get_file_size_mb(self, file_path: str) -> float:
+        """Get file size in megabytes."""
+        try:
+            size_bytes = os.path.getsize(file_path)
+            return size_bytes / (1024 * 1024)
+        except OSError:
+            return 0.0
+    
+    def _send_media_with_retry(
+        self,
+        chat_id: int,
+        file_path: str,
+        file_type: str,
+        protect_content: bool = True,
+        use_file_id: bool = False,
+        file_id: Optional[str] = None
+    ) -> bool:
+        """
+        Send media file with retry logic and exponential backoff.
+        
+        Args:
+            chat_id: Telegram chat ID
+            file_path: Path to the file (or file_id if use_file_id=True)
+            file_type: Type of file ('photo', 'video', 'audio', 'document')
+            protect_content: Whether to protect content from forwarding
+            use_file_id: If True, file_path is actually a file_id string
+            file_id: Optional file_id to use directly
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        last_exception = None
+        
+        for attempt in range(self.max_retries):
+            try:
+                if use_file_id or file_id:
+                    # Send using file_id (fast, no upload needed)
+                    file_id_to_use = file_id if file_id else file_path
+                    if file_type == 'photo':
+                        self.bot.send_photo(chat_id, file_id_to_use, protect_content=protect_content)
+                    elif file_type == 'video':
+                        self.bot.send_video(chat_id, file_id_to_use, protect_content=protect_content)
+                    elif file_type == 'audio':
+                        self.bot.send_audio(chat_id, file_id_to_use, protect_content=protect_content)
+                    elif file_type == 'document':
+                        self.bot.send_document(chat_id, file_id_to_use, protect_content=protect_content)
+                    else:
+                        return False
+                else:
+                    # Send by uploading file
+                    with open(file_path, 'rb') as file_handle:
+                        if file_type == 'photo':
+                            self.bot.send_photo(chat_id, file_handle, protect_content=protect_content)
+                        elif file_type == 'video':
+                            self.bot.send_video(chat_id, file_handle, protect_content=protect_content)
+                        elif file_type == 'audio':
+                            self.bot.send_audio(chat_id, file_handle, protect_content=protect_content)
+                        elif file_type == 'document':
+                            self.bot.send_document(chat_id, file_handle, protect_content=protect_content)
+                        else:
+                            return False
                 
-        except FileNotFoundError:
-            print(f"File not found for caching: {file_path}")
-            return None
-        except Exception as e:
-            print(f"Error uploading file to cache chat: {str(e)}")
-            return None
+                # Success!
+                if attempt > 0:
+                    self.logger.info(f"Successfully sent {file_path} after {attempt + 1} attempts")
+                return True
+                
+            except FileNotFoundError:
+                self.logger.error(f"Media file not found: {file_path}")
+                return False
+            except Exception as e:
+                last_exception = e
+                error_str = str(e).lower()
+                
+                # Check for ConnectionResetError (10054) - rate limiting or connection issues
+                is_connection_reset = (
+                    'connectionreset' in error_str or
+                    '10054' in error_str or
+                    'forcibly closed' in error_str or
+                    'connection aborted' in error_str
+                )
+                
+                # Check if it's a timeout or connection error (retryable)
+                is_retryable = (
+                    'timeout' in error_str or
+                    'connection' in error_str or
+                    'timed out' in error_str or
+                    'write operation' in error_str or
+                    is_connection_reset
+                )
+                
+                if not is_retryable:
+                    # Non-retryable error (e.g., invalid file_id, bad request)
+                    if 'file_id' in error_str or 'invalid' in error_str or 'bad request' in error_str:
+                        self.logger.warning(f"Non-retryable error for {file_path}: {str(e)}")
+                    else:
+                        self.logger.error(f"Non-retryable error for {file_path}: {str(e)}", exc_info=True)
+                    return False
+                
+                # Retryable error - log and retry
+                if attempt < self.max_retries - 1:
+                    # Use longer delay for connection resets (likely rate limiting)
+                    if is_connection_reset:
+                        delay = self.retry_delay * (2 ** attempt) + 1  # Extra delay for rate limits
+                    else:
+                        delay = self.retry_delay * (2 ** attempt)  # Exponential backoff
+                    file_size_mb = self._get_file_size_mb(file_path) if not use_file_id else 0
+                    error_type = "rate limit/connection reset" if is_connection_reset else "timeout/connection"
+                    self.logger.warning(
+                        f"{error_type.capitalize()} error sending {file_path} (attempt {attempt + 1}/{self.max_retries}, "
+                        f"size: {file_size_mb:.2f}MB): {str(e)}. Retrying in {delay}s..."
+                    )
+                    time.sleep(delay)
+                else:
+                    # Last attempt failed
+                    file_size_mb = self._get_file_size_mb(file_path) if not use_file_id else 0
+                    self.logger.error(
+                        f"Failed to send {file_path} after {self.max_retries} attempts "
+                        f"(size: {file_size_mb:.2f}MB): {str(last_exception)}",
+                        exc_info=True
+                    )
+        
+        return False
     
     def _send_media_with_cache(
         self,
@@ -197,52 +367,32 @@ class ContentSender:
         Returns:
             True if successful, False otherwise
         """
+        # Check file size and warn if large
+        file_size_mb = self._get_file_size_mb(file_path)
+        if file_size_mb > 10:
+            self.logger.warning(f"Large file detected: {file_path} ({file_size_mb:.2f}MB). This may take longer to upload.")
+        
         # Try to get file_id from cache
         file_id = self._get_or_upload_file_id(file_path, file_type)
         
         if file_id:
-            # Use cached file_id
+            # Use cached file_id (fast, no upload needed)
             try:
-                if file_type == 'photo':
-                    self.bot.send_photo(chat_id, file_id, protect_content=protect_content)
-                elif file_type == 'video':
-                    self.bot.send_video(chat_id, file_id, protect_content=protect_content)
-                elif file_type == 'audio':
-                    self.bot.send_audio(chat_id, file_id, protect_content=protect_content)
-                elif file_type == 'document':
-                    self.bot.send_document(chat_id, file_id, protect_content=protect_content)
-                else:
-                    return False
-                return True
+                return self._send_media_with_retry(
+                    chat_id, file_path, file_type, protect_content,
+                    use_file_id=True, file_id=file_id
+                )
             except Exception as e:
                 # file_id might be invalid, remove from cache and fall back to upload
                 error_str = str(e).lower()
                 if 'file_id' in error_str or 'invalid' in error_str or 'bad request' in error_str:
-                    print(f"Invalid file_id for {file_path}, removing from cache and re-uploading")
+                    self.logger.warning(f"Invalid file_id for {file_path}, removing from cache and re-uploading")
                     if self.file_id_cache:
                         self.file_id_cache.remove_file_id(file_path)
                     # Fall through to direct upload
         
         # Fall back to direct upload (cache miss or invalid file_id)
-        try:
-            with open(file_path, 'rb') as file_handle:
-                if file_type == 'photo':
-                    self.bot.send_photo(chat_id, file_handle, protect_content=protect_content)
-                elif file_type == 'video':
-                    self.bot.send_video(chat_id, file_handle, protect_content=protect_content)
-                elif file_type == 'audio':
-                    self.bot.send_audio(chat_id, file_handle, protect_content=protect_content)
-                elif file_type == 'document':
-                    self.bot.send_document(chat_id, file_handle, protect_content=protect_content)
-                else:
-                    return False
-                return True
-        except FileNotFoundError:
-            print(f"Media file not found: {file_path}")
-            return False
-        except Exception as e:
-            print(f"Error sending media file {file_path}: {str(e)}")
-            return False
+        return self._send_media_with_retry(chat_id, file_path, file_type, protect_content)
     
     def send_media_files(self, chat_id: int, media_paths: List[str]) -> bool:
         """
@@ -256,7 +406,7 @@ class ContentSender:
             True if all media files sent successfully, False otherwise
         """
         success = True
-        for media_path in media_paths:
+        for i, media_path in enumerate(media_paths):
             if self._is_image_file(media_path):
                 if not self._send_media_with_cache(chat_id, media_path, 'photo', protect_content=True):
                     success = False
@@ -268,9 +418,13 @@ class ContentSender:
                     success = False
             else:
                 # Unknown media type, try sending as document
-                print(f"Unknown media type for {media_path}, sending as document")
+                self.logger.debug(f"Unknown media type for {media_path}, sending as document")
                 if not self._send_media_with_cache(chat_id, media_path, 'document', protect_content=True):
                     success = False
+            
+            # Add delay between files to avoid rate limiting (except for last file)
+            if i < len(media_paths) - 1:
+                time.sleep(self.delay_between_files)
         
         return success
     
@@ -286,9 +440,12 @@ class ContentSender:
             True if all document files sent successfully, False otherwise
         """
         success = True
-        for doc_path in document_paths:
+        for i, doc_path in enumerate(document_paths):
             if not self._send_media_with_cache(chat_id, doc_path, 'document', protect_content=False):
                 success = False
+            # Add delay between files to avoid rate limiting (except for last file)
+            if i < len(document_paths) - 1:
+                time.sleep(self.delay_between_files)
         
         return success
     
@@ -320,7 +477,7 @@ class ContentSender:
                     file_path=file_path,
                     expiration_seconds=30
                 )
-                print(f"Published temporary link for {file_name} (expires in 30 seconds)")
+                self.logger.debug(f"Published temporary link for {file_name} (expires in 30 seconds)")
                 
                 # Get public URL from result
                 public_url = result.get('public_url')
@@ -336,12 +493,12 @@ class ContentSender:
                     links_sent = True
                 
             except APIError as e:
-                print(f"Error publishing temporary link for {file_path}: {str(e)}")
+                self.logger.error(f"Error publishing temporary link for {file_path}: {str(e)}", exc_info=True)
                 links_message += f"⚠️ {file_name} - ошибка доступа\n\n"
                 links_sent = True
                 success = False
             except Exception as e:
-                print(f"Unexpected error with {file_path}: {str(e)}")
+                self.logger.error(f"Unexpected error with {file_path}: {str(e)}", exc_info=True)
                 links_message += f"⚠️ {file_name} - ошибка\n\n"
                 links_sent = True
                 success = False
@@ -351,7 +508,7 @@ class ContentSender:
             try:
                 self.bot.send_message(chat_id, links_message.strip(), parse_mode="HTML")
             except Exception as e:
-                print(f"Error sending links message: {str(e)}")
+                self.logger.error(f"Error sending links message to chat_id {chat_id}: {str(e)}", exc_info=True)
                 success = False
         
         return success
@@ -443,9 +600,11 @@ class ContentSender:
         """
         try:
             message = self.bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
-            return message.message_id
+            if message and hasattr(message, 'message_id'):
+                return message.message_id
+            return None
         except Exception as e:
-            print(f"Error sending navigation message: {str(e)}")
+            self.logger.error(f"Error sending navigation message to chat_id {chat_id}: {str(e)}", exc_info=True)
             return None
     
     def edit_navigation_message(self, chat_id: int, message_id: int, text: str, reply_markup, parse_mode: str = "HTML") -> bool:
@@ -474,12 +633,12 @@ class ContentSender:
                 return True
             elif 'message to edit not found' in error_description or 'chat not found' in error_description:
                 # Message was deleted
-                print(f"Navigation message {message_id} not found (likely deleted)")
+                self.logger.warning(f"Navigation message {message_id} not found (likely deleted) for chat_id {chat_id}")
                 return False
             else:
-                print(f"Error editing navigation message: {str(e)}")
+                self.logger.error(f"Error editing navigation message for chat_id {chat_id}, message_id {message_id}: {str(e)}", exc_info=True)
                 return False
         except Exception as e:
-            print(f"Error editing navigation message: {str(e)}")
+            self.logger.error(f"Error editing navigation message for chat_id {chat_id}, message_id {message_id}: {str(e)}", exc_info=True)
             return False
 

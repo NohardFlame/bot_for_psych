@@ -5,9 +5,9 @@ Retrieves content from Yandex Disk folders
 """
 
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any
 from disk_api_handler.disk_handler import YandexDiskHandler, FileNotFoundError, APIError
-from datetime import date
+import re
 
 
 class ContentFetcher:
@@ -179,29 +179,51 @@ class ContentFetcher:
         Check Yandex Disk for existing day folders.
         Returns list of day numbers that have corresponding folders.
         
+        Optimized to list the program directory once instead of checking each day folder individually.
+        
         Args:
             program_key: Program key (e.g., "program_1")
             max_day: Maximum day number to check (based on begin_date and current date)
+                   Note: This parameter is kept for backward compatibility but not used in the optimized version
         
         Returns:
             List of day numbers that have corresponding folders (e.g., [1, 2, 3, 5, 7])
         """
         available = []
-        for day_num in range(1, max_day + 1):
-            day_folder = f"{day_num}_day"
-            folder_path = f"disk:/{program_key}/{day_folder}"
+        program_path = f"disk:/{program_key}"
+        
+        try:
+            # List the program directory once - much faster than checking each day folder
+            items = self.disk_handler.list_directory(program_path)
             
-            try:
-                # Try to list directory - if it exists, this will succeed
-                items = self.disk_handler.list_directory(folder_path)
-                # If we can list it, it exists
-                available.append(day_num)
-            except FileNotFoundError:
-                # Folder doesn't exist, skip it
-                continue
-            except Exception:
-                # Other errors (API errors, etc.), skip it
-                continue
+            # Filter for day folders (format: "{number}_day")
+            day_pattern = re.compile(r'^(\d+)_day$')
+            
+            for item in items:
+                if item.get('type') != 'dir':
+                    continue
+                
+                name = item.get('name', '')
+                match = day_pattern.match(name)
+                if match:
+                    day_num = int(match.group(1))
+                    # Only include days up to max_day if specified (for backward compatibility)
+                    if max_day is None or day_num <= max_day:
+                        available.append(day_num)
+            
+            # Sort the list
+            available.sort()
+            
+        except FileNotFoundError:
+            # Program directory doesn't exist
+            return []
+        except Exception as e:
+            # Other errors (API errors, etc.), return empty list
+            # Log the error for debugging (use print since logger might not be available)
+            import traceback
+            error_details = traceback.format_exc()
+            print(f"Error listing program directory {program_path}: {str(e)}\n{error_details}")
+            return []
         
         return available
 

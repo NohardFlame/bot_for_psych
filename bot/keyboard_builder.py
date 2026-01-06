@@ -165,13 +165,14 @@ class KeyboardBuilder:
             ForceReply object
         """
         # In pyTelegramBotAPI, ForceReply constructor signature:
-        # ForceReply(force_reply=True, selective=False, input_field_placeholder=None)
+        # ForceReply(selective=False, input_field_placeholder=None)
+        # Note: force_reply is not a parameter - the class itself represents a force reply
         # Check if input_field_placeholder is supported
         try:
-            return types.ForceReply(force_reply=True, input_field_placeholder=placeholder)
+            return types.ForceReply(input_field_placeholder=placeholder)
         except TypeError:
             # Fallback if input_field_placeholder is not supported
-            return types.ForceReply(force_reply=True)
+            return types.ForceReply()
     
     @staticmethod
     def build_present_folder_keyboard(

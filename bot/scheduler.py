@@ -125,35 +125,42 @@ class ContentScheduler:
             )
             
             # If date-based calculation returns empty, check for backlog (available days on disk)
+            # But only deliver days that should be available based on begin_date
             if not days_to_deliver:
-                # Calculate max day to check (use a reasonable upper limit or current day)
+                # Calculate current day based on begin_date
                 from datetime import date as dt_date, datetime
                 begin_date_obj = self.day_calculator.parse_begin_date(begin_date)
                 if begin_date_obj:
                     current_date = dt_date.today()
                     current_day = (current_date - begin_date_obj).days + 1
                     if current_day < 1:
-                        current_day = 100  # Check up to day 100 if program hasn't started
-                    max_day = max(current_day, 100)  # At least check up to day 100 for backlog
+                        # Program hasn't started yet, no backlog to deliver
+                        return True, None
                 else:
-                    max_day = 100  # Default to checking up to day 100
+                    # Invalid begin_date, can't determine current day
+                    return False, "Invalid begin_date"
                 
-                # Get available days from disk
-                available_days = self.content_fetcher.get_available_days(program_key, max_day)
+                # Get available days from disk (check up to a reasonable limit to find all days)
+                # But we'll filter by current_day below
+                max_day_to_check = max(current_day, 100)  # Check at least up to day 100 to find all days
+                available_days = self.content_fetcher.get_available_days(program_key, max_day_to_check)
+                
+                # IMPORTANT: Only deliver days that are <= current_day (based on begin_date)
+                # This ensures we don't deliver future days even if they exist on disk
+                available_days = [d for d in available_days if d <= current_day]
                 
                 # Filter out days that have already been delivered
-                if last_message_date is not None and begin_date_obj:
+                if last_message_date is not None:
                     try:
-                        from datetime import datetime
                         last_date = datetime.fromtimestamp(last_message_date).date()
                         last_day = (last_date - begin_date_obj).days + 1
-                        # Only deliver days after the last delivered day
+                        # Only deliver days after the last delivered day, but still <= current_day
                         days_to_deliver = [d for d in available_days if d > last_day]
                     except (ValueError, OSError):
-                        # Invalid timestamp, deliver all available days
+                        # Invalid timestamp, deliver all available days up to current_day
                         days_to_deliver = available_days
                 else:
-                    # No last_message_date or begin_date, deliver all available days
+                    # No last_message_date, deliver all available days up to current_day
                     days_to_deliver = available_days
             
             if not days_to_deliver:
