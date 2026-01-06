@@ -19,6 +19,7 @@ try:
     from .file_id_cache import FileIdCache
     from .keyboard_builder import KeyboardBuilder
     from .present_navigator import PresentNavigator
+    from .operation_logger import setup_logger
 except ImportError:
     from user_manager import UserManager
     from day_calculator import DayCalculator
@@ -28,6 +29,7 @@ except ImportError:
     from file_id_cache import FileIdCache
     from keyboard_builder import KeyboardBuilder
     from present_navigator import PresentNavigator
+    from operation_logger import setup_logger
 
 from disk_api_handler.disk_handler import YandexDiskHandler
 
@@ -61,6 +63,10 @@ class DailyContentBot:
             
             if not bot_token_value:
                 raise ValueError("Bot token is empty")
+        
+        # Initialize logger
+        self.logger = setup_logger()
+        self.logger.info("Initializing DailyContentBot")
         
         # Initialize bot
         self.bot = telebot.TeleBot(bot_token_value)
@@ -206,6 +212,7 @@ class DailyContentBot:
         except Exception as e:
             error_msg = f"Неожиданная ошибка: {str(e)}"
             print(error_msg)
+            self.logger.error(f"Unexpected error in _handle_present_folder_navigation for chat_id {chat_id}: {str(e)}", exc_info=True)
             self.bot.send_message(chat_id, f"❌ {error_msg}", parse_mode="HTML")
     
     def _deliver_single_day(self, username: str, chat_id: int, day_number: int) -> bool:
@@ -255,12 +262,14 @@ class DailyContentBot:
                 # Update last_message_date (optional - we might want to track which days were viewed)
                 # For now, we'll just update it to the day that was delivered
                 self.user_manager.update_user_last_message_date(username, day_number, begin_date)
+                self.logger.debug(f"Updated last_message_date for user {username} to day {day_number}")
             
             return success
             
         except Exception as e:
             error_msg = f"Ошибка при доставке дня {day_number}: {str(e)}"
             print(error_msg)
+            self.logger.error(f"Error delivering day {day_number} to user {username} (chat_id: {chat_id}): {str(e)}", exc_info=True)
             return False
     
     def _handle_present_folder_navigation(self, chat_id: int, folder_path: str = "") -> None:
@@ -358,6 +367,7 @@ class DailyContentBot:
             """Handle /start command."""
             chat_id = message.chat.id
             username = message.from_user.username
+            self.logger.info(f"Received /start command from user {username} (chat_id: {chat_id})")
             
             # Check for deep link parameter (p=)
             # Format: /start p=option1 or /start p=option1/option2 or /start p= (for root)
@@ -425,6 +435,7 @@ class DailyContentBot:
             """Handle /set_name command."""
             chat_id = message.chat.id
             username = message.from_user.username
+            self.logger.info(f"Received /set_name command from user {username} (chat_id: {chat_id})")
             
             if not username:
                 self.bot.reply_to(
@@ -504,6 +515,7 @@ class DailyContentBot:
             """Handle /get_day command - show navigation keyboard."""
             chat_id = message.chat.id
             username = message.from_user.username
+            self.logger.info(f"Received /get_day command from user {username} (chat_id: {chat_id})")
             
             if not username:
                 self.bot.reply_to(
@@ -541,6 +553,8 @@ class DailyContentBot:
             """Handle main menu button clicks."""
             chat_id = message.chat.id
             username = message.from_user.username
+            button_text = message.text
+            self.logger.info(f"Main menu button clicked: {button_text} by user {username} (chat_id: {chat_id})")
             
             if not username:
                 return
@@ -669,6 +683,7 @@ class DailyContentBot:
                     # User selected a day
                     day_number = parsed.get('day_number')
                     if day_number:
+                        self.logger.info(f"User {username} (chat_id: {chat_id}) selected day {day_number}")
                         # Show loading message
                         loading_msg = self.bot.send_message(chat_id, f"⏳ Загрузка контента для дня {day_number}...", parse_mode="HTML")
                         
@@ -682,11 +697,14 @@ class DailyContentBot:
                             pass
                         
                         if not success:
+                            self.logger.warning(f"Failed to deliver content for day {day_number} to user {username} (chat_id: {chat_id})")
                             self.bot.send_message(
                                 chat_id,
                                 f"❌ Не удалось загрузить контент для дня {day_number}. Возможно, контент еще не готов.",
                                 parse_mode="HTML"
                             )
+                        else:
+                            self.logger.info(f"Successfully delivered content for day {day_number} to user {username} (chat_id: {chat_id})")
                 
                 elif action in ('prev_page', 'next_page'):
                     # Navigation - change page
@@ -706,6 +724,7 @@ class DailyContentBot:
             except Exception as e:
                 error_msg = f"Ошибка: {str(e)}"
                 print(error_msg)
+                self.logger.error(f"Error in callback handler for user {username} (chat_id: {chat_id}): {str(e)}", exc_info=True)
                 self.bot.send_message(chat_id, f"❌ {error_msg}", parse_mode="HTML")
         
         @self.bot.message_handler(func=lambda message: True)
@@ -723,8 +742,10 @@ class DailyContentBot:
             # Check if we're waiting for name
             if chat_id in self.user_states and self.user_states[chat_id] == "waiting_name":
                 name = message.text.strip()
+                self.logger.info(f"User {username} (chat_id: {chat_id}) provided name: {name}")
                 
                 if self.user_manager.set_user_name(username, name):
+                    self.logger.info(f"Successfully set name '{name}' for user {username} (chat_id: {chat_id})")
                     self.bot.reply_to(
                         message,
                         f"✅ Имя успешно установлено: {name}\n\n"
@@ -733,6 +754,7 @@ class DailyContentBot:
                     )
                     self.user_states.pop(chat_id, None)
                 else:
+                    self.logger.warning(f"Failed to set name for user {username} (chat_id: {chat_id}): name is empty")
                     self.bot.reply_to(
                         message,
                         "❌ Имя не может быть пустым. Пожалуйста, укажите ваше имя."
@@ -869,6 +891,7 @@ class DailyContentBot:
         except Exception as e:
             error_msg = f"Неожиданная ошибка: {str(e)}"
             print(error_msg)
+            self.logger.error(f"Unexpected error in _deliver_content_to_user for user {username} (chat_id: {chat_id}): {str(e)}", exc_info=True)
             if message:
                 self.bot.reply_to(message, f"❌ {error_msg}")
             else:
@@ -877,6 +900,7 @@ class DailyContentBot:
     def start(self) -> None:
         """Start the bot and scheduler."""
         print("Starting bot...")
+        self.logger.info("Starting bot...")
         
         # Load user_chat_map from handler_list.Json (persisted chat_ids)
         persisted_chat_map = self.user_manager.get_all_users_with_chat_ids()
@@ -884,24 +908,31 @@ class DailyContentBot:
         
         if persisted_chat_map:
             print(f"Loaded {len(persisted_chat_map)} users with chat_ids from handler_list.Json")
+            self.logger.info(f"Loaded {len(persisted_chat_map)} users with chat_ids from handler_list.Json")
         
         # Start scheduler (with persisted user_chat_map)
         # Note: scheduler will update as users interact with bot
         self.scheduler.start(self.user_chat_map)
+        self.logger.info("Scheduler started")
         
         print("Bot is running. Press Ctrl+C to stop.")
+        self.logger.info("Bot is running")
         try:
             self.bot.infinity_polling()
         except KeyboardInterrupt:
             print("\nStopping bot...")
+            self.logger.info("Received KeyboardInterrupt, stopping bot...")
             self.stop()
             print("Bot stopped.")
+            self.logger.info("Bot stopped")
     
     def stop(self) -> None:
         """Stop the bot and scheduler gracefully."""
+        self.logger.info("Stopping bot and scheduler...")
         # Stop scheduler first
         if hasattr(self, 'scheduler') and self.scheduler:
             self.scheduler.stop()
+            self.logger.info("Scheduler stopped")
         
         # Stop bot polling
         if hasattr(self, 'bot') and self.bot:
@@ -913,7 +944,9 @@ class DailyContentBot:
                     self.bot.stop_bot()
             except Exception as e:
                 # If stopping fails, log but continue
-                print(f"Warning: Could not stop bot gracefully: {str(e)}")
+                error_msg = f"Warning: Could not stop bot gracefully: {str(e)}"
+                print(error_msg)
+                self.logger.warning(error_msg)
     
     def _get_cache_chat_id(self) -> Optional[int]:
         """

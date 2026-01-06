@@ -80,25 +80,47 @@ class YandexDiskHandler:
     
     def _normalize_path(self, path: str) -> str:
         """
-        Normalize path format for SDK compatibility.
+        Normalize path format for SDK compatibility and prepend "bot/" folder.
         
         SDK expects paths in format "disk:/path" or "disk:/" for root.
-        This method converts paths from "/path" or "path" format to "disk:/path".
+        This method converts paths from "/path" or "path" format to "disk:/path"
+        and automatically prepends "bot/" so all operations work from the "bot" folder
+        instead of the root.
         
         Args:
             path: Path to normalize.
         
         Returns:
-            Normalized path string.
+            Normalized path string with "bot/" prefix (e.g., "disk:/bot/path").
         """
-        if path == "/":
-            return "disk:/"
+        # Handle empty string as root
+        if not path or path == "/":
+            return "disk:/bot"
+        
+        # First, normalize to "disk:/" format
         if not path.startswith("disk:/"):
             if path.startswith("/"):
-                return "disk:" + path
+                normalized = "disk:" + path
             else:
-                return "disk:/" + path
-        return path
+                normalized = "disk:/" + path
+        else:
+            normalized = path
+        
+        # Handle root case
+        if normalized == "disk:/":
+            return "disk:/bot"
+        
+        # Check if path already starts with "disk:/bot/" to avoid double-prefixing
+        if normalized.startswith("disk:/bot/"):
+            return normalized
+        
+        # Insert "bot/" after "disk:/"
+        # "disk:/path" -> "disk:/bot/path"
+        if normalized.startswith("disk:/"):
+            return "disk:/bot" + normalized[6:]  # Remove "disk:/" (6 chars), add "disk:/bot"
+        
+        # Fallback (shouldn't reach here, but just in case)
+        return normalized
     
     def _handle_sdk_exception(self, exception: Exception) -> None:
         """

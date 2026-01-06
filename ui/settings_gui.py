@@ -9,7 +9,6 @@ from tkinter import ttk, messagebox, simpledialog
 import configparser
 import json
 import threading
-import webbrowser
 import time
 import os
 from pathlib import Path
@@ -21,6 +20,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from bot.bot import DailyContentBot
 from disk_api_handler.disk_handler import YandexDiskHandler, APIError
+
+# Import logger for GUI operations
+try:
+    from bot.operation_logger import get_logger
+except ImportError:
+    from operation_logger import get_logger
 
 
 class BotSettingsGUI:
@@ -55,6 +60,10 @@ class BotSettingsGUI:
         self.file_poll_running = False
         self.file_poll_thread = None
         self.user_editing = False  # Flag to pause polling during edits
+        
+        # Initialize logger
+        self.logger = get_logger()
+        self.logger.info("BotSettingsGUI initialized")
         
         # Load handler list data
         self.handler_data: Dict[str, Any] = {}
@@ -194,6 +203,7 @@ class BotSettingsGUI:
             settings_frame, textvariable=self.bot_token_var, show="*", width=50
         )
         bot_token_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=8, pady=8)
+        bot_token_entry.bind('<Control-v>', lambda e: bot_token_entry.event_generate('<<Paste>>'))
         
         # Disk token
         ttk.Label(settings_frame, text="Токен Яндекс.Диска:").grid(
@@ -204,6 +214,7 @@ class BotSettingsGUI:
             settings_frame, textvariable=self.disk_token_var, show="*", width=50
         )
         disk_token_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), padx=8, pady=8)
+        disk_token_entry.bind('<Control-v>', lambda e: disk_token_entry.event_generate('<<Paste>>'))
         
         # Buttons
         buttons_frame = ttk.Frame(settings_frame)
@@ -286,13 +297,12 @@ class BotSettingsGUI:
         self._refresh_users_tree()
     
     def _create_bottom_section(self, parent):
-        """Create bottom section with bot control and disk link."""
+        """Create bottom section with bot control."""
         bottom_frame = ttk.Frame(parent)
         bottom_frame.grid(row=4, column=0, sticky=(tk.W, tk.E), padx=5, pady=5)
         bottom_frame.columnconfigure(0, weight=1)
-        bottom_frame.columnconfigure(1, weight=1)
         
-        # Bot Control Section (Left)
+        # Bot Control Section
         bot_frame = ttk.LabelFrame(bottom_frame, text="Управление ботом", padding="12")
         bot_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=8)
         
@@ -313,6 +323,7 @@ class BotSettingsGUI:
         self.delivery_time_var = tk.StringVar(value="09:00")
         time_entry = ttk.Entry(time_frame, textvariable=self.delivery_time_var, width=8)
         time_entry.pack(side=tk.LEFT, padx=6)
+        time_entry.bind('<Control-v>', lambda e: time_entry.event_generate('<<Paste>>'))
         ttk.Label(time_frame, text="(ЧЧ:ММ)").pack(side=tk.LEFT, padx=4)
         
         ttk.Button(
@@ -336,18 +347,6 @@ class BotSettingsGUI:
         self.current_errors = []
         self.error_poll_thread = None
         self.error_poll_running = False
-        
-        # Disk Link Section (Right)
-        disk_frame = ttk.LabelFrame(bottom_frame, text="Яндекс.Диск", padding="12")
-        disk_frame.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=8)
-        
-        self.disk_link_button = ttk.Button(
-            disk_frame, text="Открыть Яндекс.Диск", command=self._open_disk_link
-        )
-        self.disk_link_button.pack(pady=8)
-        
-        self.disk_status_label = ttk.Label(disk_frame, text="")
-        self.disk_status_label.pack(pady=6)
     
     def _load_settings(self):
         """Load settings from settings.ini file."""
@@ -399,9 +398,11 @@ class BotSettingsGUI:
             
             self._update_file_mtimes()
             self.user_editing = False
+            self.logger.info("Settings saved successfully")
             messagebox.showinfo("Успех", "Настройки сохранены")
         except Exception as e:
             self.user_editing = False
+            self.logger.error(f"Failed to save settings: {str(e)}", exc_info=True)
             messagebox.showerror("Ошибка", f"Не удалось сохранить настройки: {str(e)}")
     
     def _load_handler_list(self):
@@ -884,6 +885,7 @@ class BotSettingsGUI:
     def _save_users(self):
         """Save users to handler_list.Json."""
         if self._save_handler_list():
+            self.logger.info("Users data saved successfully")
             messagebox.showinfo("Успех", "Изменения сохранены")
     
     def _start_bot(self):
@@ -891,15 +893,19 @@ class BotSettingsGUI:
         if self.bot_running:
             return
         
+        self.logger.info("Starting bot from GUI")
+        
         # Validate tokens
         bot_token = self.bot_token_var.get().strip()
         disk_token = self.disk_token_var.get().strip()
         
         if not bot_token:
+            self.logger.warning("Attempted to start bot without bot token")
             messagebox.showerror("Ошибка", "Токен бота не указан")
             return
         
         if not disk_token:
+            self.logger.warning("Attempted to start bot without disk token")
             messagebox.showerror("Ошибка", "Токен Яндекс.Диска не указан")
             return
         
@@ -948,12 +954,15 @@ class BotSettingsGUI:
             
             self.bot_running = True
             self._update_bot_status(True)
+            self.logger.info("Bot started successfully from GUI")
             
             # Start error polling
             self._start_error_polling()
             
         except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось запустить бота: {str(e)}")
+            error_msg = f"Не удалось запустить бота: {str(e)}"
+            self.logger.error(f"Failed to start bot: {str(e)}", exc_info=True)
+            messagebox.showerror("Ошибка", error_msg)
             self.bot_running = False
             self._update_bot_status(False)
     
@@ -1143,6 +1152,7 @@ class BotSettingsGUI:
             return
         
         try:
+            self.logger.info("Stopping bot from GUI")
             # Stop error polling first
             self._stop_error_polling()
             
@@ -1150,44 +1160,13 @@ class BotSettingsGUI:
             self.bot_instance.stop()
             self.bot_running = False
             self._update_bot_status(False)
+            self.logger.info("Bot stopped successfully from GUI")
         except Exception as e:
-            print(f"Error stopping bot: {str(e)}")
+            error_msg = f"Error stopping bot: {str(e)}"
+            print(error_msg)
+            self.logger.error(error_msg, exc_info=True)
             self.bot_running = False
             self._update_bot_status(False)
-    
-    def _open_disk_link(self):
-        """Open Yandex Disk root folder link."""
-        disk_token = self.disk_token_var.get().strip()
-        
-        if not disk_token:
-            messagebox.showerror("Ошибка", "Токен Яндекс.Диска не указан")
-            return
-        
-        self.disk_status_label.config(text="Загрузка...", foreground="blue")
-        self.disk_link_button.config(state='disabled')
-        
-        def fetch_link():
-            try:
-                handler = YandexDiskHandler(token=disk_token)
-                link = handler.get_root_folder_link()
-                
-                if link:
-                    self.root.after(0, lambda: webbrowser.open(link))
-                    self.root.after(0, lambda: self.disk_status_label.config(
-                        text="Ссылка открыта", foreground="green"
-                    ))
-                else:
-                    self.root.after(0, lambda: self.disk_status_label.config(
-                        text="Не удалось получить ссылку", foreground="red"
-                    ))
-            except Exception as e:
-                self.root.after(0, lambda: self.disk_status_label.config(
-                    text=f"Ошибка: {str(e)}", foreground="red"
-                ))
-            finally:
-                self.root.after(0, lambda: self.disk_link_button.config(state='normal'))
-        
-        threading.Thread(target=fetch_link, daemon=True).start()
     
     def _on_closing(self):
         """Handle window closing event."""
